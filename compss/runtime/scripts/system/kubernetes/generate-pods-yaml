@@ -1,0 +1,269 @@
+#!/bin/bash
+
+# Retrieve script arguments
+NUM_WORKERS="$1"                  # Number of container workers
+APP_IMAGE_NAME="$2"               # Application image name. With username: 'john123/my-app'
+ABS_CONTEXT="$3"                  # Absolute path where the context dir is located. This must be specified by the app-image provider.
+CU="$4"
+
+read -ra COMPUTING_UNITS <<< "$CU" &> /dev/null
+MEMORY="$5"
+COMPSS_MASTER_HOSTNAME="$6"
+CREATION_TIME="$7"
+MIN_VMS="$8"
+MAX_VMS="$9"
+shift 9
+
+PROFILING_MODE="$1"
+WORKER_ORDER="$2"
+read -ra WORKER_ORDER <<< "$WORKER_ORDER" &> /dev/null
+TMP_PATH="$3"
+NAMESPACE="$4"
+shift 4
+
+RUNCOMPSS_ARGS=$*     # From here on, the typical runcompss parameters you would use
+#
+# This will include: creating the xml's inside master container, executing runcompss, and shutting down workers.
+#
+MASTER_COMMAND=""
+CLOUD="False"
+if [ ${MAX_VMS}  -gt 0 ]; then
+  CLOUD="True"
+fi
+
+# Create project and resources
+MASTER_COMMAND="${MASTER_COMMAND} /opt/COMPSs/Runtime/scripts/system/kubernetes/generate_k8s_resources.sh $ABS_CONTEXT/resources.xml $NUM_WORKERS \"$(echo ${COMPUTING_UNITS[@]})\" $MEMORY $COMPSS_MASTER_HOSTNAME $APP_IMAGE_NAME $CLOUD $CREATION_TIME ; "
+MASTER_COMMAND="${MASTER_COMMAND} /opt/COMPSs/Runtime/scripts/system/kubernetes/generate_k8s_project.sh $ABS_CONTEXT/project.xml $NUM_WORKERS $APP_IMAGE_NAME $MIN_VMS $MAX_VMS ; "
+
+# Add their path to the runcompss args
+RUNCOMPSS_ARGS=" --resources=$ABS_CONTEXT/resources.xml $RUNCOMPSS_ARGS"
+RUNCOMPSS_ARGS=" --project=$ABS_CONTEXT/project.xml  $RUNCOMPSS_ARGS"
+RUNCOMPSS_ARGS=" --master_name=master $RUNCOMPSS_ARGS"
+# Execute the runcompss command itself, from the context directory
+MASTER_COMMAND="${MASTER_COMMAND} cd ${ABS_CONTEXT} ; /opt/COMPSs/Runtime/scripts/user/runcompss $RUNCOMPSS_ARGS 2>&1;"
+
+IMG_NAME_WITHOUT_USERNAME="$(echo "$APP_IMAGE_NAME" | sed -e 's|[A-Za-z0-9_]*/||g'| sed -e 's|[:.]|_|g')"
+IMG_WITHOUT_TAG="$(echo "$APP_IMAGE_NAME" | awk -F'[:/]' '{print $2}')"
+
+# After the execution ends, stop all the workers. This is, stop their sshd
+# Concatenating with ; to ALWAYS shutdown nodes even if the above commands fail
+for i in $(seq 0 $(("$NUM_WORKERS" - 1))); do
+    MASTER_COMMAND="${MASTER_COMMAND} ssh -o StrictHostKeyChecking=no ${IMG_WITHOUT_TAG}-worker-${i} \"pkill sshd\" ;"
+done
+# keep master alive 30s so runcompss-k8s can copy the results to local
+MASTER_COMMAND="${MASTER_COMMAND} sleep 30 ; exit 0"
+
+######### KUBERNETES RESOURCE CREATION #########
+# Create workers depending if profiling is activated and if app is using it
+# Profiling execution
+if [ $PROFILING_MODE = true ]; then
+    #TMP_PATH="$(dirname "$0")/tmp" # Added (comment ALBA)
+    w_i=$(cat $TMP_PATH/w_i.txt) # Take current w_id (starting from 1 not 0) # Added (comment ALBA)
+    echo -e "\
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${IMG_WITHOUT_TAG}-master
+  namespace: ${NAMESPACE}
+  labels:
+    app: compss
+    node: master
+spec:
+  nodeName: ${WORKER_ORDER[((w_i-1))]}
+  hostname: master
+  subdomain: ${IMG_WITHOUT_TAG}-svc
+  restartPolicy: Never
+  dnsConfig:
+    searches:
+    - ${IMG_WITHOUT_TAG}-svc.${NAMESPACE}.svc.cluster.local
+  #initContainers:
+  #- name: wait-for-service
+  #  image: $APP_IMAGE_NAME
+  #  command: [ "/bin/bash", "-c" ]
+  #  args: [ "bash /opt/COMPSs/Runtime/scripts/utils/ssh_status.sh $NUM_WORKERS" ]
+  containers:
+  - name: master
+    image: $APP_IMAGE_NAME
+    env: 
+    - name: DEPLOYMENT_NAME
+      value: ${IMG_WITHOUT_TAG}-${WORKER_ORDER[((w_i-1))]}
+    command: [ "/bin/bash", "-c", "${MASTER_COMMAND}" ]
+    ports:
+      - containerPort: 22
+        name: ssh-port
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${IMG_WITHOUT_TAG}-svc
+  namespace: ${NAMESPACE}
+spec:
+  clusterIP: None  # This makes it a headless service
+  selector:
+    app: compss
+  ports:
+  - name: port-22
+    protocol: TCP
+    port: 22
+    targetPort: ssh-port
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${IMG_WITHOUT_TAG}-worker-0
+  namespace: ${NAMESPACE}
+  labels:
+    app: compss
+    node: ${IMG_WITHOUT_TAG}-${WORKER_ORDER[((w_i-1))]}-worker-0
+spec:
+  nodeName: ${WORKER_ORDER[((w_i-1))]}
+  hostname: ${IMG_WITHOUT_TAG}-${WORKER_ORDER[((w_i-1))]}-worker-0
+  subdomain: ${IMG_WITHOUT_TAG}-svc
+  restartPolicy: Never
+  dnsConfig:
+    searches:
+    - ${IMG_WITHOUT_TAG}-svc.${NAMESPACE}.svc.cluster.local
+  containers:
+  - name: ${IMG_WITHOUT_TAG}-worker-0
+    image: ${APP_IMAGE_NAME}
+    command:
+    - "/bin/bash"
+    - "-c"
+    - "/usr/sbin/sshd -D"
+    resources:
+      limits:
+        memory: ${MEMORY}G
+        cpu: '${COMPUTING_UNITS[0]}'
+    ports:
+      - containerPort: 22
+        name: ssh-port"
+else
+    # Create master Pod and headless Service 
+    echo -e "\
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${IMG_WITHOUT_TAG}-master
+  namespace: ${NAMESPACE}
+  labels:
+    app: compss
+    node: master
+spec:
+  hostname: master
+  subdomain: ${IMG_WITHOUT_TAG}-svc
+  restartPolicy: Never
+  dnsConfig:
+    searches:
+    - ${IMG_WITHOUT_TAG}-svc.${NAMESPACE}.svc.cluster.local
+  #initContainers:
+  #- name: wait-for-service
+  #  image: $APP_IMAGE_NAME
+  #  command: [ "/bin/bash", "-c" ]
+  #  args: [ "bash /opt/COMPSs/Runtime/scripts/utils/ssh_status.sh $NUM_WORKERS" ]
+  containers:
+  - name: master
+    image: $APP_IMAGE_NAME
+    command: [ "/bin/bash", "-c", "${MASTER_COMMAND}" ]
+    ports:
+      - containerPort: 22
+        name: ssh-port
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${IMG_WITHOUT_TAG}-svc
+  namespace: ${NAMESPACE}
+spec:
+  clusterIP: None  # This makes it a headless service
+  selector:
+    app: compss
+  ports:
+  - name: port-22
+    protocol: TCP
+    port: 22
+    targetPort: ssh-port
+---"
+    # app is being executed with previous profiling results
+    if [ ! -z "$WORKER_ORDER" ]; then  
+        for i in $(seq 1 "${NUM_WORKERS}"); do
+        echo -e "\
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${IMG_WITHOUT_TAG}-worker$i
+  namespace: ${NAMESPACE}
+  labels:
+    app: compss
+    node: worker
+spec:
+  nodeName: ${WORKER_ORDER[((i-1))]}
+  hostname: worker$i
+  subdomain: ${IMG_WITHOUT_TAG}-svc
+  restartPolicy: Never
+  dnsConfig:
+    searches:
+    - ${IMG_WITHOUT_TAG}-svc.${NAMESPACE}.svc.cluster.local
+  containers:
+  - name: worker$i
+    image: ${APP_IMAGE_NAME}
+    command:
+      - "/bin/bash"
+      - "-c"
+      - "/usr/sbin/sshd -D"
+    resources:
+      limits:
+        memory: ${MEMORY}G
+        cpu: '${COMPUTING_UNITS[((i-1))]}'
+    ports:
+      - containerPort: 22
+        name: ssh-port
+---"       
+        done
+    # Application executed without previous profiling
+    else
+        for i in $(seq 1 "${NUM_WORKERS}"); do
+            echo -e "\
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${IMG_WITHOUT_TAG}-worker$i
+  namespace: ${NAMESPACE}
+  labels:
+    app: compss
+    node: worker
+spec:
+  hostname: worker$i
+  subdomain: ${IMG_WITHOUT_TAG}-svc
+  restartPolicy: Never
+  dnsConfig:
+    searches:
+    - ${IMG_WITHOUT_TAG}-svc.${NAMESPACE}.svc.cluster.local
+  # Make worker nodes run in different nodes
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchExpressions:
+          - key: node
+            operator: In
+            values:
+            - worker
+        topologyKey: kubernetes.io/hostname
+  containers:
+  - name: worker$i
+    image: ${APP_IMAGE_NAME}
+    command:
+    - "/bin/bash"
+    - "-c"
+    - "/usr/sbin/sshd -D"
+    resources:
+      limits:
+        memory: ${MEMORY}G
+        cpu: '${COMPUTING_UNITS[((i-1))]}'
+    ports:
+    - containerPort: 22
+      name: ssh-port
+---"
+        done
+    fi
+fi

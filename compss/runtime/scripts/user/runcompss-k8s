@@ -1,0 +1,550 @@
+#!/bin/bash -e
+
+#
+# SCRIPT CONSTANTS
+#
+GENERATORS_DIR=$(dirname "$0")/../system/kubernetes
+GENERATE_DEPLOYMENT_YML="$GENERATORS_DIR/generate-pods-yaml"
+GENERATE_ROLE_YML="$GENERATORS_DIR/generate-sa-role-yaml"
+GENERATE_IPERF3_SERVER_YML="$GENERATORS_DIR/generate-iperf3-server-yaml"
+GENERATE_IPERF3_CLIENT_YML="$GENERATORS_DIR/generate-iperf3-client-yaml"
+COMPSS_MASTER_HOSTNAME="master"
+DEFAULT_MEM=4
+DEFAULT_CU=2
+DEFAULT_ELASTIC=0
+DEFAULT_PROFILING_MODE=false
+DEFAULT_WORKER_ORDER=""
+DEFAULT_NAMESPACE=default
+
+#
+# HELPER FUNCTIONS
+#
+source "$GENERATORS_DIR/aux_functions.sh"
+
+showHelp() {
+  echo -e "
+::::::::::::::: [  RUNCOMPSS-K8S  -  HELP  ] ::::::::::::::::::::::
+
+In order to use runcompss-k8s you must have a working Kubernetes cluster,
+and you need to have installed and configured in this computer the kubectl CLI.
+
+Usage: $0
+            --worker-pods=N
+            --image-name=\"DOCKERHUB_USER/IMG-NAME\"
+			[rest of classic runcompss args]
+
+Example: $0
+            --worker-pods=5
+            --image-name='compss-user-dockerhub/my-app:1.3'
+            --classpath=/home/compss-user/my-app-dir/my-app.jar # Here begin classic runcompss arguments...
+            -d
+            myPackage.MyApp 3 15
+
+
+MANDATORY ARGUMENTS:
+
+    --w, --worker-pods:  Specify the number of worker containers the app will execute on.
+                               One more container will be created to host the master.
+                               Example: --worker-pods=2
+
+    --i, --image-name:         Specify the image name of the application image in Dockerhub. Remember you must generate this with runcompss-docker-gen-image.
+                               Remember as well that the format must be: \"DOCKERHUB_USERNAME/APP_IMAGE_NAME:TAG\" (the :TAG is optional).
+                               Example: --image-name='john123/my-compss-application:1.9'
+
+    --c, --context-dir:        Specify the absolute application context directory inside the image.
+	            		       When using an application image, its provider must give you this information.
+                               Example: --context-dir='/home/compss-user/my-app-dir'
+
+OPTIONAL ARGUMENTS:
+
+    --c-cpu-units:             Specify the number of CPU units used by each container (default value is $DEFAULT_CU).
+                               Example: --c-cpu-units=16
+
+    --c-memory:                Specify the physical memory used by each container in GB (default value is $DEFAULT_MEM GB).
+                               Example: --c-memory=32  # (each container will use 32 GB)
+
+    --c-creation-time:         Time required to create a Kubernetes Pod (default: 60 sec)
+                               Example: --c-creation-time=12
+
+    --c-elasticity:            Number of worker Pods to run on cloud mode (default: $DEFAULT_ELASTIC)
+                               Example: --c-elasticity=2
+
+    --c-namespace               Kubernetes namespace where the application will be executed (default: $DEFAULT_NAMESPACE)
+                                Example: --c-namespace=prometheus-test
+
+    --profiling-mode           Set the execution in profiling mode to capture application data to apply further heuristics (default: $DEFAULT_PROFILING_MODE)
+                               Example: --profiling-mode=true or --profiling-mode=false
+
+    --worker-order             Order in which workers will be executed to do the profiling or use heuristics.
+                               Example: --worker-order="hostname1 hostname2 hostname3"
+
+::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+"
+}
+
+# Get the status of the master Pod
+get_worker_status(){
+    wait_before=$1
+    if [ -n ${wait_before} ]; then
+      sleep ${wait_before}
+    fi 
+
+    WORKER_POD_STATUS=$(kubectl --namespace $NAMESPACE get pods "$IMG_WITHOUT_TAG"-worker1 -o=jsonpath='{.status.phase}')
+    ECHO "COMPSs worker1 Pod status: $WORKER_POD_STATUS"
+}
+
+# Get the execution results form the master Pod0
+retrieve_results() {
+    ECHO "Retrieving results from the master Pod"
+
+    RESULTS_DIR="$1"
+    DEPLOYMENT_NAME="$2"
+
+    rm -rf "$RESULTS_DIR" &> /dev/null
+    
+    DEBUG_DIR="$RESULTS_DIR/debug"
+    mkdir -p "$DEBUG_DIR" &> /dev/null
+  
+    CONTEXT_DIR="$RESULTS_DIR/context-dir"
+    mkdir -p "$CONTEXT_DIR" &> /dev/null
+
+    # Copy files from the pod
+    kubectl --namespace $NAMESPACE cp "$DEPLOYMENT_NAME:/root/.COMPSs" "$DEBUG_DIR" &> /dev/null
+    ASSERT "Results could not be retrieved. Master Pod unreachable"
+
+    # Get logs
+    kubectl --namespace $NAMESPACE logs "$DEPLOYMENT_NAME" 1> "$RESULTS_DIR/application_log.out" 2> "$RESULTS_DIR/application_log.err"
+    ASSERT "Logs could not be retrieved. Master Pod unreachable"
+
+    # Get context directory
+    kubectl --namespace $NAMESPACE cp "$DEPLOYMENT_NAME":"$ABS_CONTEXT" "$CONTEXT_DIR" &> /dev/null
+    ASSERT "Context directory could not be retrieved. Master Pod unreachable"
+
+    ECHO "Results successfully retrieved!" 
+    ECHO "Check the application results in $RESULTS_DIR"
+    ECHO "In case you had debug enabled, check: $DEBUG_DIR"
+    echo
+}
+
+# $1 = hostname of the node the server is running in
+# $2 = name of server pod
+retrieve_results_iperf3() {
+    ECHO "Retrieving results from iperf3 server in $1"
+    client_order="${client_order%,}"   # remove trailing hyphen
+    mkdir -p "$PROFILING_DIR/results/iperf3"
+
+    echo "client_order=$client_order" > "$PROFILING_DIR/results/iperf3/server-$1.txt"
+
+    kubectl --namespace $NAMESPACE logs "$2" >> "$PROFILING_DIR/results/iperf3/server-$1.txt"
+    ECHO "Results successfully retrieved from iperf3 server in $1!"
+}
+
+#
+# MAIN
+#
+
+ALL_ARGS=( "$@" )
+COMPUTING_UNITS="$DEFAULT_CU"
+MEMORY="$DEFAULT_MEM"
+CREATION_TIME=60
+MIN_VMS=0
+MAX_VMS="$DEFAULT_ELASTIC"
+WORKER_ORDER="$DEFAULT_WORKER_ORDER"
+PROFILING_MODE="$DEFAULT_PROFILING_MODE"
+NAMESPACE="$DEFAULT_NAMESPACE"
+RUNCOMPSS_ARGS="$*" # this loop will strip from RUNCOMPSS_ARGS all the runcomps-k8s args
+
+# Check parameters
+if [ -z "$1" ] || [ "$1" == "--help" ] || [ "$1" == "-h" ]
+then
+    showHelp
+    exit 2
+fi
+
+# Retrieve parameters
+for ARG in "${ALL_ARGS[@]}"; do
+    argName="$(echo "$ARG" | cut -c 3- | cut -d= -f1)"
+    argValue="$(echo "$ARG" | cut -d= -f2)"
+
+    RD_GOOD_ARG=0
+    if [ "$argName" = "worker-pods" ] || [ "$argName" = "w" ]; then
+        if echo "$argValue" | grep -q -E "^[1-9][0-9]{0,}$"; then
+            NUM_WORKER_PODS="$argValue"
+            RD_GOOD_ARG=1
+        else
+            ERROR "The --worker-pods argument must be a number >= 1. It's the number of worker containers that runcompss docker will spread across nodes (without taking into account the master container)."
+        fi
+    elif [ "$argName" = "image-name" ] || [ "$argName" = "i" ]; then
+    	IMAGE_NAME="$argValue"
+        RD_GOOD_ARG=1
+    elif [ "$argName" = "context-dir" ] || [ "$argName" = "c" ]; then
+        ABS_CONTEXT="$argValue"
+        RD_GOOD_ARG=1
+    elif [ "$argName" = "c-cpu-units" ]; then
+        COMPUTING_UNITS="$argValue"
+        RD_GOOD_ARG=1
+    elif [ "$argName" = "c-memory" ]; then
+        MEMORY="$argValue"
+        RD_GOOD_ARG=1
+    elif [ "$argName" = "c-creation-time" ]; then
+        CREATION_TIME="$argValue"
+        RD_GOOD_ARG=1
+    elif [ "$argName" = "c-elasticity" ]; then
+        MAX_VMS="$argValue"
+        RD_GOOD_ARG=1
+    elif [ "$argName" = "profiling-mode" ]; then
+        PROFILING_MODE="$argValue"
+        RD_GOOD_ARG=1
+    elif [ "$argName" = "worker-order" ]; then
+        WORKER_ORDER="$argValue"
+        RD_GOOD_ARG=1
+    elif [ "$argName" = "c-namespace" ]; then
+        NAMESPACE="$argValue"
+        RD_GOOD_ARG=1
+    fi
+
+    if [ "$RD_GOOD_ARG" = "1" ]; then
+         # strip it from ALL_ARGS
+        RUNCOMPSS_ARGS=$(echo "$RUNCOMPSS_ARGS" | sed "s|${ARG}||g")
+    fi
+done
+
+# If any required argument is missing, the ALL_GOOD variable is set to 0
+ALL_GOOD=1
+if [ -z "$NUM_WORKER_PODS" ]; then
+    ERROR "Indicate the number of workers before runcompss args ('--worker-pods=3' for example)"
+    ALL_GOOD=0
+fi
+
+if [ -z "$IMAGE_NAME" ]; then
+    ERROR "Indicate the image name. ('--image-name=compss-user/my-app-image' for example)."
+    ALL_GOOD=0
+fi
+
+if [ -z "$ABS_CONTEXT" ]; then
+    ERROR "Indicate the absolute context directory. Remember that the provider of this image must give you this information. ('--context-dir='/home/john123/apps/compss-app' for example)"
+    ALL_GOOD=0
+fi
+
+# Number of Pods verification
+CLUSTER_WORKERS=$(kubectl get nodes --selector='!node-role.kubernetes.io/control-plane' --no-headers | wc -l)
+if (( $NUM_WORKER_PODS > $CLUSTER_WORKERS )); then
+    ERROR "You are trying to deploy more worker pods than nodes in the cluster"
+    ALL_GOOD=0
+fi
+
+# Worker order verification
+WORKER_ORDER_WITH_SPACES=$(echo "$WORKER_ORDER" | tr ',' ' ')
+IFS=' ' read -ra WORKER_ORDER <<< "$WORKER_ORDER_WITH_SPACES" &> /dev/null
+if [ ! -z "$WORKER_ORDER" ]; then    
+    if [ "${#WORKER_ORDER[@]}" -ne "$NUM_WORKER_PODS" ]; then
+        ERROR "The number of workers in worker-order must be the same of --worker-pods"
+        ALL_GOOD=0
+    fi 
+fi
+
+# Profiling verification
+if [ "$PROFILING_MODE" != true ] && [ "$PROFILING_MODE" != false ]; then
+    ERROR "The profiling mode specified is not correct (true or false)"
+    ALL_GOOD=0
+fi
+
+if [ "$PROFILING_MODE" = true ] && [ ! -z "$WORKER_ORDER" ]; then
+    ERROR "The worker order should be used when you already have profiling results or when using multiple cpus."
+    ALL_GOOD=0
+fi
+
+# Computing units verification
+COMPUTING_UNITS_WITH_SPACES=$(echo "$COMPUTING_UNITS" | tr ',' ' ')
+IFS=' ' read -ra COMPUTING_UNITS <<< "$COMPUTING_UNITS_WITH_SPACES" &> /dev/null
+if [ "${#COMPUTING_UNITS[@]}" -ne 1 ] && [ -z "$WORKER_ORDER" ]; then
+    ERROR "You have to specify a worker order if you want different computing units"
+    ALL_GOOD=0
+fi
+
+if [ "${#COMPUTING_UNITS[@]}" -ne 1 ] && [ "${#COMPUTING_UNITS[@]}" -ne "$NUM_WORKER_PODS" ]; then
+    ERROR "The number of computing units must be 1 or the number of workers"
+    ALL_GOOD=0
+fi
+
+# Required argument missing or incorrect optional parameters
+if [ "$ALL_GOOD" = "0" ]; then
+    echo
+    ECHO "Run 'runcompss-k8s --help' if you need help."
+    echo
+    exit 1
+fi
+
+# check if there is a computing unit per node. If not, set every computing unit to the first param
+if [ "${#COMPUTING_UNITS[@]}" -eq 1 ]; then
+    # new computing units array with size num workers and all elements the same
+    cu="${COMPUTING_UNITS[0]}"
+    COMPUTING_UNITS=()
+    for i in $(seq 1 $NUM_WORKER_PODS); do
+        COMPUTING_UNITS+=("${cu}")
+    done
+fi
+
+# Log parameters
+ECHO "Execution summary -----------------"
+ECHO "Namespace                 $NAMESPACE"
+ECHO "Profiling mode:           $PROFILING_MODE"
+if [ ! -z "$WORKER_ORDER" ]; then
+    SHOW_WORKER_ORDER=$(echo ${WORKER_ORDER[@]})
+    ECHO "Worker order:             $SHOW_WORKER_ORDER"
+fi
+SHOW_CU="$(echo ${COMPUTING_UNITS[@]})"
+ECHO "Pod CPU units:            $SHOW_CU"
+ECHO "Pod memory:               $MEMORY GB"
+ECHO "Image name:               $IMAGE_NAME"
+ECHO "Number of workers:        $NUM_WORKER_PODS"
+ECHO "Context directory:        $ABS_CONTEXT"
+ECHO "Elastic Pods:             $MAX_VMS"
+ECHO "-----------------------------------"
+echo 
+
+IMG_NAME_WITHOUT_USERNAME="$(echo "$IMAGE_NAME" | sed -e 's|[A-Za-z0-9_]*/||g'| sed -e 's|[:.]|_|g')"
+IMG_WITHOUT_TAG="$(echo "$IMAGE_NAME" | awk -F'[:/]' '{print $2}')"
+
+CURRENT_DATE=$(date +'%Y-%m-%d-%H-%M')
+
+if [ "$PROFILING_MODE" = true ]; then
+    #kubectl create namespace $NAMESPACE &> /dev/null
+
+    # tmp path to store current worker index
+    TMP_PATH="$(dirname "$0")/tmp" 
+    mkdir -p $TMP_PATH 
+
+    # create profiling dirs
+    PROFILING_DIR="$(dirname "$0")/results/profiling/$CURRENT_DATE"
+    PROFILING_YAML_DIR="$PROFILING_DIR/yaml"
+    mkdir -p "$PROFILING_YAML_DIR" &> /dev/null
+
+    PROFILING_CONFIG_DIR="$PROFILING_DIR/config"
+    mkdir -p "$PROFILING_CONFIG_DIR" &> /dev/null
+    
+    # get the name of the first $NUM_WORKER_PODS worker nodes
+    WORKERS=$(kubectl --namespace $NAMESPACE get nodes --selector='!node-role.kubernetes.io/control-plane' --no-headers | awk '{print $1}' | head -n $NUM_WORKER_PODS)
+    readarray -t WORKER_ORDER <<< "$WORKERS"
+    for (( i=0; i<${#WORKER_ORDER[@]}; i++ )); do
+        echo "worker$((i+1))    ${WORKER_ORDER[i]}" >> "$PROFILING_CONFIG_DIR/worker_order.txt"
+    done
+
+    # execute app in each worker in parallel
+    for w in $(seq 1 "${NUM_WORKER_PODS}"); do  
+        hostname="${WORKER_ORDER[((w-1))]}"
+    
+        # create directories used by profiling
+        echo "$w" > "$TMP_PATH/w_i.txt" # Save current worker index for the GENERATE_COMPOSE_YML
+        
+        # Generate Kubernetes deployments YAML file
+        ECHO "Generating profiling-$hostname.yaml file into ${PROFILING_YAML_DIR}"
+        $GENERATE_DEPLOYMENT_YML "1" "$IMAGE_NAME" "$ABS_CONTEXT" "${COMPUTING_UNITS[((w-1))]}" "$MEMORY" "$COMPSS_MASTER_HOSTNAME" "$CREATION_TIME" "$MIN_VMS" "$MAX_VMS" "$PROFILING_MODE" "$(echo ${WORKER_ORDER[@]})" "$TMP_PATH" "$NAMESPACE" "$RUNCOMPSS_ARGS" > "${PROFILING_YAML_DIR}/profiling-$hostname.yaml"
+        ASSERT "There was an error creating the Kubernetes deployments YAML file."
+        # Modify master and worker names in YAML to avoid repeating
+        sed -i "s|${IMG_WITHOUT_TAG}-master|${IMG_WITHOUT_TAG}-${hostname}-master|g; s|${IMG_WITHOUT_TAG}-worker-0|${IMG_WITHOUT_TAG}-${hostname}-worker-0|g; s|${IMG_WITHOUT_TAG}-svc|${IMG_WITHOUT_TAG}-${hostname}-svc|g; s|StrictHostKeyChecking=no ${IMG_WITHOUT_TAG}-worker-0|StrictHostKeyChecking=no ${IMG_WITHOUT_TAG}-${hostname}-worker-0|g;" "${PROFILING_YAML_DIR}/profiling-$hostname.yaml"
+
+        # Add a trap for results retrieval
+        trap "retrieve_results ; exit 1" SIGINT ERR
+        # Execute worker Pod
+        ECHO "Executing worker in node $hostname of the cluster"
+        kubectl --namespace $NAMESPACE apply -f "${PROFILING_YAML_DIR}/profiling-$hostname.yaml" &> /dev/null
+        ASSERT "There was an error executing worker. Check the logs or the deployment output."
+    done
+    
+    # Initialize an associative array to keep track of which workers are still active
+    declare -A active_workers
+    for hostname in "${WORKER_ORDER[@]}"; do
+        active_workers[$hostname]=1
+    done
+    # Loop until all workers are processed
+    while [ ${#active_workers[@]} -gt 0 ]; do
+        for hostname in "${!active_workers[@]}"; do
+            WORKER_POD_STATUS=$(kubectl --namespace $NAMESPACE get pods "$IMG_WITHOUT_TAG-$hostname-worker-0" -o=jsonpath='{.status.phase}')
+            # Check if pod has completed (Succeeded or Failed)
+            if [[ "$WORKER_POD_STATUS" != "Running" && "$WORKER_POD_STATUS" != "Pending" ]]; then
+                echo; ECHO "Worker $hostname has completed with status $WORKER_POD_STATUS."
+                # Perform retrieval and cleanup for this worker
+                retrieve_results "$PROFILING_DIR/results/$hostname" "${IMG_WITHOUT_TAG}-$hostname-master"
+                
+                # Remove this worker from the list of active workers
+                unset active_workers[$hostname]
+            fi
+        done
+        if [ ${#active_workers[@]} -gt 0 ]; then
+            ECHO "Waiting for workers from all nodes to finish"
+            sleep 5 # Wait before checking again
+        fi
+    done
+    
+    ECHO "Cleaning environment from the execution"
+    for w in $(seq 1 "${NUM_WORKER_PODS}"); do  
+        hostname="${WORKER_ORDER[((w-1))]}"
+        kubectl --namespace $NAMESPACE delete -f "${PROFILING_YAML_DIR}/profiling-$hostname.yaml" &> /dev/null || true
+    done
+    rm -rf "$TMP_PATH" 
+
+    # Calculate network bandwith between all nodes
+    echo; ECHO "Calculating network bandwith between nodes"
+    IPERF3_YAML_DIR="${PROFILING_YAML_DIR}/iperf3"
+    mkdir -p "$IPERF3_YAML_DIR" &> /dev/null
+
+    SERVER_POD_NAME="iperf3-server"
+    CLIENT_POD_NAME="iperf3-client"
+    num_nodes=$((${#WORKER_ORDER[@]}-1))
+
+    for w in $(seq 0 $(($num_nodes-1))); do
+        server="${WORKER_ORDER[$w]}"
+        ECHO "Executing iperf3 server in node $server of the cluster"
+        
+        # Generate server YAML file
+        $GENERATE_IPERF3_SERVER_YML "$server" "$SERVER_POD_NAME" "$NAMESPACE" > "${IPERF3_YAML_DIR}/iperf3-server-$server.yaml"
+        
+        # Add a trap for results retrieval
+        trap "retrieve_results_iperf3 ; exit 1" SIGINT ERR
+        
+        # Create iperf3 server Pod and Service
+        kubectl --namespace $NAMESPACE apply -f "${IPERF3_YAML_DIR}/iperf3-server-$server.yaml" &> /dev/null
+        ASSERT "There was an error executing the iperf3 server. Check the logs or the deployment output."
+
+        client_i=$((w+1))
+        client_order=""     # string to use in result name concatenating client nodes (p.eg "hostname1,hostname2,hostname3")
+        for i in $(seq "$client_i" "$num_nodes"); do
+            sleep 2
+            
+            client="${WORKER_ORDER[$i]}"
+            client_order+="${client},"
+            
+            ECHO "Executing iperf3 client in node $client of the cluster"
+            # Generate client YAML file
+            $GENERATE_IPERF3_CLIENT_YML "$client" "$CLIENT_POD_NAME" "$NAMESPACE" > "${IPERF3_YAML_DIR}/iperf3-server-$server-client-$client.yaml"
+            # Create iperf3 client Pod 
+            kubectl --namespace $NAMESPACE apply -f "${IPERF3_YAML_DIR}/iperf3-server-$server-client-$client.yaml" &> /dev/null
+            ASSERT "There was an error executing the iperf3 server. Check the logs or the deployment output."
+
+            # wait for client to finish
+            client_status=$(kubectl --namespace $NAMESPACE get pod $CLIENT_POD_NAME -o=jsonpath='{.status.phase}')
+            while [[ "$client_status" != "Succeeded" ]]; do
+                ECHO "Waiting for iperf3 client in $client to finish"
+                sleep 5
+                client_status=$(kubectl --namespace $NAMESPACE get pod $CLIENT_POD_NAME -o=jsonpath='{.status.phase}')
+            done
+
+            # delete client
+            kubectl --namespace $NAMESPACE delete -f "${IPERF3_YAML_DIR}/iperf3-server-$server-client-$client.yaml" &> /dev/null
+        done
+        # Get results from server node
+        retrieve_results_iperf3 "$server" "$SERVER_POD_NAME"
+        # Delete server
+        kubectl --namespace $NAMESPACE delete -f "${IPERF3_YAML_DIR}/iperf3-server-$server.yaml" &> /dev/null
+        sleep 2
+    done
+
+    # Calculate bandwith matrix
+    declare -A bitrates
+
+    for filename in "$PROFILING_DIR/results/iperf3"/*.txt; do
+        # Get server name
+        server_name=$(basename "$filename" .txt | sed "s/server-//")
+        # Add a 0 to the diagonal of the server in the matrix
+        bitrates["$server_name","$server_name"]=0
+        # Get client_order from the first line
+        IFS=' ' read -r -a client_order <<< "$(sed -n '1 s/client_order=//p' "$filename" | tr ',' ' ')"
+        # read each client bitrate
+        num_line=1  # do not take into account the first line (clients_order)
+        for client in "${client_order[@]}"; do
+            # Every iperf3 output is 20 lines, so the bitrate is in (21*i)-th line
+            num_line=$((num_line + 20))
+
+            bitrate_line=$(sed -n "${num_line}{p;q;}" "$filename")
+            bitrate=$(echo "$bitrate_line" | awk '{print $7}')
+
+            # store bitrate in matrix
+            bitrates["$server_name","$client"]="$bitrate"
+            bitrates["$client","$server_name"]="$bitrate"
+        done
+    done
+
+    # Save matrix to a file
+    mkdir -p "$PROFILING_DIR/data_files"
+
+    # Print the matrix header
+    echo "ibw = [" > "$PROFILING_DIR/data_files/iperf-matrix.dat"
+
+    for row in "${WORKER_ORDER[@]}"; do
+        for col in "${WORKER_ORDER[@]}"; do
+            if [[ "$row" == "$col" ]]; then # Diagonal elements of matrix
+                echo -n "0 " >> "$PROFILING_DIR/data_files/iperf-matrix.dat"
+            else
+                inverse=$(echo "scale=6; 1 / ${bitrates[$row,$col]}" | bc)
+                echo -n "$inverse " >> "$PROFILING_DIR/data_files/iperf-matrix.dat"
+            fi
+        done
+        echo >> "$PROFILING_DIR/data_files/iperf-matrix.dat" # Newline after each row
+    done
+
+    # Close the matrix
+    echo "];" >> "$PROFILING_DIR/data_files/iperf-matrix.dat"
+
+    # Execute profiling and save results to config file
+    # Profiling script $1=input_path, $output_path  
+    ECHO "Executing profiling"
+    bash $(dirname "$0")/../utils/profiling/profiling.sh "$(readlink -f $PROFILING_DIR)" "$(echo ${WORKER_ORDER[@]})" "$(echo ${COMPUTING_UNITS[@]})"
+
+else
+    # Create application directories
+    APP_DIR="$(dirname "$0")/results/application/$CURRENT_DATE"
+    APP_YAML_DIR="$APP_DIR/yaml"
+    mkdir -p "$APP_YAML_DIR" &> /dev/null
+
+    # Generate Kubernetes deployments YAML file
+    ECHO "Generating deployment.yaml file into $APP_YAML_DIR" 
+    $GENERATE_DEPLOYMENT_YML "$NUM_WORKER_PODS" "$IMAGE_NAME" "$ABS_CONTEXT" "$(echo ${COMPUTING_UNITS[@]})" "$MEMORY" "$COMPSS_MASTER_HOSTNAME" "$CREATION_TIME" "$MIN_VMS" "$MAX_VMS" "$PROFILING_MODE" "$(echo ${WORKER_ORDER[@]})" "$NAMESPACE" "$RUNCOMPSS_ARGS" > "$APP_YAML_DIR/deployment.yaml"
+    ASSERT "There was an error creating the Kubernetes deployment YAML file."
+
+    # Generate default ServiceAccount role for Cloud Connector
+    if [ "$MAX_VMS" -gt 0 ]; then
+        $GENERATE_ROLE_YML > "$APP_YAML_DIR/sa-role.yaml" 
+        ASSERT "There was an error creating the ServiceAccount role YAML file."
+    fi
+
+    # Add a trap for results retrieval
+    trap "retrieve_results ; exit 1" SIGINT ERR
+
+    # Delete hanging Pods from previous executions
+    ECHO "Cleaning environment from previous executions" 
+    kubectl --namespace $NAMESPACE delete -f "$APP_YAML_DIR/deployment.yaml" &> /dev/null || true
+    if [ "$MAX_VMS" -gt 0 ]; then
+        kubectl --namespace $NAMESPACE delete -f "$APP_YAML_DIR/sa-role.yaml" &> /dev/null || true
+    fi
+
+    ECHO "Executing application in Kubernetes cluster" 
+
+    # Create role and binding for Cloud Connector
+    if [ "$MAX_VMS" -gt 0 ]; then
+        kubectl --namespace $NAMESPACE apply -f "$APP_YAML_DIR/sa-role.yaml" &> /dev/null
+    fi
+
+    # Deploy compss Pods and Service 
+    kubectl --namespace $NAMESPACE apply -f "$APP_YAML_DIR/deployment.yaml" &> /dev/null
+    ASSERT "There was an error executing the application. Check the logs or the deployment output."
+
+    ECHO "Waiting for the application to finish" ; echo
+    get_worker_status 5
+    while [[ "$WORKER_POD_STATUS" == "Running" || "$WORKER_POD_STATUS" == "ContainerCreating"  ]]; do
+        get_worker_status 5
+    done
+    echo; ECHO "Application finished!"
+
+    # Get results
+    retrieve_results "$APP_DIR/results" "$IMG_WITHOUT_TAG-master"
+
+    # Delete Pods and Services created during the execution
+    ECHO "Cleaning environment from the execution" 
+    kubectl --namespace $NAMESPACE delete -f "$APP_YAML_DIR/deployment.yaml" &> /dev/null || true
+    if [ $MAX_VMS -gt 0 ]; then
+        kubectl --namespace $NAMESPACE delete -f "$APP_YAML_DIR/sa-role.yaml" &> /dev/null || true
+    fi
+fi
+
+exit 0

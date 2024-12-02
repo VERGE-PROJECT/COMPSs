@@ -1,0 +1,4 @@
+FROM albabsc/compss:3.3
+
+COPY ./compss/runtime/scripts/system/kubernetes/generate_k8s_project.sh /opt/COMPSs/Runtime/scripts/system/kubernetes/generate_k8s_project.sh
+COPY ./compss/runtime/scripts/system/kubernetes/generate_k8s_resources.sh /opt/COMPSs/Runtime/scripts/system/kubernetes/generate_k8s_resources.sh

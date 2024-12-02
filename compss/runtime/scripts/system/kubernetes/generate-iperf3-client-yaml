@@ -1,0 +1,23 @@
+#!/bin/bash
+
+# Retrieve script arguments
+CLIENT_NODE="$1"
+CLIENT_POD_NAME="$2"
+NAMESPACE="$3"
+IPERF3_IMAGE="albabsc/iperf3"
+
+# Create client Pod 
+echo -e "\
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${CLIENT_POD_NAME}
+  namespace: ${NAMESPACE}
+spec:
+  nodeName: ${CLIENT_NODE}
+  restartPolicy: Never
+  containers:
+  - name: ${CLIENT_POD_NAME}
+    image: ${IPERF3_IMAGE}
+    args: [\"-c\", \"iperf3-svc\", \"-p\", \"5201\"]
+"

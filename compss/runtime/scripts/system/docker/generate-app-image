@@ -1,0 +1,93 @@
+#!/bin/bash
+
+GENERATORS_DIR=$(dirname "$0")
+# shellcheck source=./aux_functions.sh
+source "$GENERATORS_DIR/aux_functions.sh"
+
+ABS_CONTEXT=$1
+BASE_IMAGE_NAME=$2
+APP_IMAGE_NAME=$3
+PYTHON_PACKAGES=$4
+APT_PACKAGES=$5
+
+ECHO "Generating Dockerfile..."
+{
+    echo "ARG TOTAL_IMAGES=i0"
+    echo "ARG BASE_CONTAINER=$BASE_IMAGE_NAME-amd"
+
+    echo "FROM --platform=linux/amd64 $BASE_IMAGE_NAME-amd AS ssh-amd"
+
+    echo "FROM \$BASE_CONTAINER AS i0"
+    echo "RUN mkdir -p $ABS_CONTEXT \
+    yes yes | ssh-keygen -f /root/.ssh/id_rsa -t rsa -N '' > /dev/null ; \ 
+    cat /root/.ssh/id_rsa.pub > /root/.ssh/authorized_keys" 
+    echo "COPY . $ABS_CONTEXT"
+    if [ ! -z "$PYTHON_PACKAGES" ]; then
+        echo "RUN pip install $PYTHON_PACKAGES"
+    fi
+    
+    echo "FROM i0 AS i1"
+    echo "COPY --from=ssh-amd /root/.ssh /root/.ssh"
+
+    echo "FROM \$TOTAL_IMAGES AS final"
+
+} > "$ABS_CONTEXT"/Dockerfile
+
+ECHO "Creating buildx builder 'compss-application'..."
+docker buildx create --name compss-application --use
+ASSERT "Failed to create buildx builder"
+
+check_image_exists() {
+    docker manifest inspect "$1" > /dev/null 2>&1
+    return $?
+}
+
+total_images=0
+
+# Build for amd architecture
+ECHO "Checking if image '$BASE_IMAGE_NAME-amd' exists..."
+if check_image_exists "$BASE_IMAGE_NAME-amd"; then
+    docker buildx build \
+    --no-cache \
+    --provenance false \
+    --push \
+    --platform linux/amd64 \
+    --build-arg TOTAL_IMAGES=i$total_images \
+    --build-arg BASE_CONTAINER=$BASE_IMAGE_NAME-amd \
+    --target=final \
+    --tag="$APP_IMAGE_NAME-amd" "$ABS_CONTEXT"
+
+    total_images=$((total_images + 1))
+fi
+
+# Build for arm architecture
+ECHO "Checking if image '$BASE_IMAGE_NAME-arm' exists..."
+if check_image_exists "$BASE_IMAGE_NAME-arm"; then
+    docker buildx build \
+        --no-cache \
+        --provenance false \
+        --push \
+        --platform linux/arm64 \
+        --build-arg TOTAL_IMAGES=i$total_images \
+        --build-arg BASE_CONTAINER=$BASE_IMAGE_NAME-arm \
+        --target=final \
+        --tag="$APP_IMAGE_NAME-arm" "$ABS_CONTEXT"
+        total_images=$((total_images + 1))
+fi
+
+if [ $total_images -eq 2 ]; then
+    ECHO "Creating docker manifest..."
+    docker manifest create $APP_IMAGE_NAME \
+        --amend $APP_IMAGE_NAME-arm \
+        --amend $APP_IMAGE_NAME-amd
+    docker manifest push --purge $APP_IMAGE_NAME
+fi
+
+# Remove the builder after use
+ECHO "Removing buildx builder 'compss-application'..."
+docker buildx rm compss-application
+ASSERT "There was a problem removing the buildx builder"
+
+rm "$ABS_CONTEXT"/Dockerfile &> /dev/null
+
+exit 0

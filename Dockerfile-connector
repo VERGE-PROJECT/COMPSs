@@ -1,0 +1,4 @@
+FROM albabsc/compss:3.3-k8s-amd
+
+COPY utils/kubernetes/k8s-conn.jar /opt/COMPSs/Runtime/cloud-conn/k8s-conn.jar
+RUN mvn install:install-file -DgroupId=es.bsc.conn -DartifactId=k8s-conn -Dversion=1.0-0 -Dpackaging=jar -Dfile=/opt/COMPSs/Runtime/cloud-conn/k8s-conn.jar

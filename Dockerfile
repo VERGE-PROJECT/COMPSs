@@ -1,0 +1,93 @@
+ARG DEBIAN_FRONTEND=noninteractive
+ARG BASE=base20
+ARG BASE_VERSION=240626-160344
+ARG FULL_BASE_CONTAINER=registry.gitlab.bsc.es/ppc/software/compss/full_base:3.3-amd
+ARG MIN_BASE_CONTAINER=registry.gitlab.bsc.es/ppc/software/compss/min_base:3.3-amd
+
+FROM $FULL_BASE_CONTAINER AS ci
+ENV GRADLE_HOME=/opt/gradle
+ENV PATH=$PATH:/opt/gradle/bin
+
+COPY . /framework
+
+ENV PATH=$PATH:/opt/COMPSs/Runtime/scripts/user:/opt/COMPSs/Bindings/c/bin:/opt/COMPSs/Runtime/scripts/utils:/opt/gradle/bin
+ENV CLASSPATH=/opt/COMPSs/Runtime/compss-engine.jar
+ENV LD_LIBRARY_PATH=/opt/COMPSs/Bindings/bindings-common/lib:$LD_LIBRARY_PATH
+ENV COMPSS_HOME=/opt/COMPSs/
+
+# Install COMPSs
+RUN cd /framework && \
+    ./submodules_get.sh && \
+    /framework/builders/buildlocal /opt/COMPSs && \
+    mv /root/.m2 /home/jenkins && \
+    chown -R jenkins: /framework && \
+    chown -R jenkins: /home/jenkins/ && \
+    python3 -m pip install --no-cache-dir rocrate==0.9.0
+
+# Expose SSH port and run SSHD
+EXPOSE 22
+CMD ["/usr/sbin/sshd","-D"]
+
+FROM $MIN_BASE_CONTAINER AS compss
+
+COPY --from=ci /opt/COMPSs /opt/COMPSs
+COPY --from=ci /etc/init.d/compss-monitor /etc/init.d/compss-monitor
+COPY --from=ci /etc/profile.d/compss.sh /etc/profile.d/compss.sh
+
+ENV PATH=$PATH:/opt/COMPSs/Runtime/scripts/user:/opt/COMPSs/Bindings/c/bin:/opt/COMPSs/Runtime/scripts/utils
+ENV CLASSPATH=/opt/COMPSs/Runtime/compss-engine.jar
+ENV LD_LIBRARY_PATH=/opt/COMPSs/Bindings/bindings-common/lib:$LD_LIBRARY_PATH
+ENV COMPSS_HOME=/opt/COMPSs/
+
+EXPOSE 22
+CMD ["/usr/sbin/sshd","-D"]
+
+FROM compss/${BASE}_tutorial:${BASE_VERSION} AS compss-tutorial
+
+COPY --from=ci /opt/COMPSs /opt/COMPSs
+COPY --from=ci /etc/init.d/compss-monitor /etc/init.d/compss-monitor
+COPY --from=ci /etc/profile.d/compss.sh /etc/profile.d/compss.sh
+
+ENV PATH=$PATH:/opt/COMPSs/Runtime/scripts/user:/opt/COMPSs/Bindings/c/bin:/opt/COMPSs/Runtime/scripts/utils:/root/.local/bin
+ENV CLASSPATH=$CLASSPATH:/opt/COMPSs/Runtime/compss-engine.jar
+ENV LD_LIBRARY_PATH=/opt/COMPSs/Bindings/bindings-common/lib:$LD_LIBRARY_PATH
+ENV COMPSS_HOME=/opt/COMPSs/
+ENV PYTHONPATH $COMPSS_HOME/Bindings/python/3:$PYTHONPATH
+
+RUN python3 -m pip install --no-cache-dir dislib jupyterlab==3.6.3 rocrate==0.9.0 && \
+    apt-get update && apt-get install -y --no-install-recommends jq bc ca-certificates curl gnupg && \
+    git clone https://github.com/bsc-wdc/jupyter-extension.git je && \
+    cd je && python3 -m pip install ./ipycompss_kernel && \
+    cd ipycompss_lab_extension && mkdir -p /etc/apt/keyrings && \
+    curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg && \
+    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_16.x nodistro main" | tee /etc/apt/sources.list.d/nodesource.list && \
+    apt-get update && apt-get install -y --no-install-recommends --no-upgrade nodejs python3.8-tk && \
+    jlpm install --network-timeout 600000 --network-concurrency 100 && jlpm run build:prod && python3 -m pip install . && \
+    apt-get autoclean && rm -rf /var/lib/apt/lists/* && cd ../../ && rm -r je
+
+EXPOSE 22
+EXPOSE 43000-44000
+CMD ["/usr/sbin/sshd","-D"]
+
+FROM compss/${BASE}_rt:${BASE_VERSION} AS minimal
+
+COPY --from=ci /opt/COMPSs /opt/COMPSs
+COPY --from=ci /etc/profile.d/compss.sh /etc/profile.d/compss.sh
+
+# ENV JAVA_HOME /usr/lib/jvm/java-8-openjdk-amd64/
+ENV PATH=$PATH:/opt/COMPSs/Runtime/scripts/user:/opt/COMPSs/Bindings/c/bin:/opt/COMPSs/Runtime/scripts/utils
+ENV CLASSPATH=$CLASSPATH:/opt/COMPSs/Runtime/compss-engine.jar
+ENV LD_LIBRARY_PATH=/opt/COMPSs/Bindings/bindings-common/lib:$LD_LIBRARY_PATH
+ENV COMPSS_HOME=/opt/COMPSs/
+
+FROM compss/${BASE}_python:${BASE_VERSION} AS pycompss 
+
+COPY --from=ci /opt/COMPSs /opt/COMPSs
+COPY --from=ci /etc/init.d/compss-monitor /etc/init.d/compss-monitor
+COPY --from=ci /etc/profile.d/compss.sh /etc/profile.d/compss.sh
+
+# ENV JAVA_HOME /usr/lib/jvm/java-8-openjdk-amd64/
+ENV PATH=$PATH:/opt/COMPSs/Runtime/scripts/user:/opt/COMPSs/Bindings/c/bin:/opt/COMPSs/Runtime/scripts/utils
+ENV CLASSPATH=$CLASSPATH:/opt/COMPSs/Runtime/compss-engine.jar
+ENV LD_LIBRARY_PATH=/opt/COMPSs/Bindings/bindings-common/lib:$LD_LIBRARY_PATH
+ENV COMPSS_HOME=/opt/COMPSs/

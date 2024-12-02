@@ -1,0 +1,42 @@
+#!/bin/bash
+
+# Retrieve script arguments
+SERVER_NODE="$1"
+SERVER_POD_NAME="$2"
+NAMESPACE="$3"
+IPERF3_IMAGE="albabsc/iperf3"
+
+# Create server Pod
+echo -e "\
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${SERVER_POD_NAME}
+  namespace: ${NAMESPACE}
+  labels:
+    app: ${SERVER_POD_NAME}
+spec:
+  nodeName: ${SERVER_NODE}
+  containers:
+  - name: ${SERVER_POD_NAME}
+    image: ${IPERF3_IMAGE}
+    args: [\"-s\", \"-p\", \"5201\", \"--format\", \"Mbits\"]
+    ports:
+    - containerPort: 5201
+---"
+
+# Create network Service
+echo -e "\
+apiVersion: v1
+kind: Service
+metadata:
+  name: iperf3-svc
+  namespace: ${NAMESPACE}
+spec:
+  selector:
+    app: ${SERVER_POD_NAME}
+  ports:
+    - protocol: TCP
+      port: 5201
+      targetPort: 5201
+"
